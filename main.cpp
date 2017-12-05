@@ -11,7 +11,9 @@ constexpr Example EXAMPLE_TO_BUILD = Example::Callbacks; // <--- select what to 
 #include <chrono>
 #include <future>
 #include <iostream>
+#include <regex>
 #include <string>
+#include <stdexcept>
 #include <string_view>
 #include <system_error>
 #include <thread>
@@ -30,10 +32,14 @@ public:
         , socket_(io_context)
     {}
 
-    using page_type = std::tuple<std::string, std::string>;
-    std::future<page_type> get_page(const std::string& host, const std::string& port)
+    struct response_data {
+        int         code = 0;
+        std::string header;
+        std::string body;
+    };
+    std::future<response_data> get_page(const std::string& host, const std::string& port)
     {
-        promise_ = std::promise<page_type>{};
+        promise_ = std::promise<response_data>{};
         request_ = "GET / HTTP/1.0\r\nHost: "s + host + "\r\nAccept: */*\r\nConnection: close\r\n\r\n"s;
         connect(host, port);
         return promise_.get_future();
@@ -64,9 +70,14 @@ private:
     {
         net::async_read_until(socket_, net::dynamic_buffer(header_), HEADER_END,
             [this](auto ec, std::size_t bytes_in_header) {
-                if (!ec) {
-                    assert(header_.find(HEADER_END) + HEADER_END.length() == bytes_in_header
-                        && bytes_in_header <= header_.length());
+                if (!ec) 
+                {
+                    assert(header_.find(HEADER_END) + HEADER_END.length() == bytes_in_header && bytes_in_header <= header_.length());
+                    // Extract the HTTP response code from the 1st line
+                    if (std::smatch m; std::regex_search(header_, m, std::regex(R"=(^HTTP\/\d\.\d\s(\d+).*)=")) && m.size() == 2) {
+                        response_code_ = std::stoi(m[1].str());
+                    }
+
                     read_body(bytes_in_header);
                 } else {
                     promise_.set_exception(std::make_exception_ptr(ec));
@@ -87,8 +98,9 @@ private:
                         body_.insert(0, header_.substr(bytes_in_header));
                     }
 
-                    promise_.set_value( page_type{std::move(header_.substr(0, bytes_in_header - HEADER_END.length())), 
-                                                  std::move(body_)} );
+                    promise_.set_value( response_data{ response_code_,
+                                                       std::move(header_.substr(0, bytes_in_header - HEADER_END.length())), 
+                                                       std::move(body_)} );
                 } else {
                     promise_.set_exception(std::make_exception_ptr(ec));
                 }
@@ -102,9 +114,10 @@ private:
     net::io_context&     io_context_;
     net::ip::tcp::socket socket_;
     std::string          request_;
+    int                  response_code_ = 0;
     std::string          header_;
     std::string          body_;
-    std::promise<page_type> promise_;
+    std::promise<response_data> promise_;
 };
 const std::string web_page_getter::HEADER_END = "\r\n\r\n"s;
 #endif
@@ -275,14 +288,17 @@ int main(int, char*[])
         auto work = net::make_work_guard(io_context);
         std::thread t = std::thread([&io_context]() { io_context.run(); });
 
-        web_page_getter hpg(io_context);
+        web_page_getter wpg(io_context);
 
-        auto f = hpg.get_page(domain, "http");
+        auto f = wpg.get_page(domain, "http");
         try {
-            auto result = f.get();
-            std::cout << "Header:\n" << std::get<0>(result)
-                      <<"\n====================================\n"
-                      << "Body:\n" << std::get<1>(result) << std::endl;
+            auto [code, header, body] = f.get();
+            std::cout 
+                << "HTTP response code: " << code
+                << "\n====================================\n"
+                << "Header:\n" << header
+                << "\n====================================\n"
+                << "Body:\n" << body << std::endl;
         }
         catch (const std::error_code& e) {
             std::cerr << "Error "<< e.value() <<": \""<< e.message() <<"\"" << std::endl;
