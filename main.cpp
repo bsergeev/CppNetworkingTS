@@ -23,109 +23,11 @@ namespace net = std::experimental::net;
 using namespace std::chrono_literals;
 using namespace std::string_literals;
 
-#if (1) //(EXAMPLE_TO_BUILD == Example::Callbacks)
-class web_page_getter
-{
-public:
-    explicit web_page_getter(net::io_context& io_context)
-        : io_context_(io_context)
-        , socket_(io_context)
-    {}
-
-    struct response_data {
-        int         code = 0;
-        std::string header;
-        std::string body;
-    };
-    std::future<response_data> get_page(const std::string& host, const std::string& port)
-    {
-        promise_ = std::promise<response_data>{};
-        request_ = "GET / HTTP/1.0\r\nHost: "s + host + "\r\nAccept: */*\r\nConnection: close\r\n\r\n"s;
-        connect(host, port);
-        return promise_.get_future();
-    }
-
-private:
-    void connect(const std::string& host, const std::string& port)
-    {
-        net::ip::tcp::resolver resolver(io_context_);
-        net::async_connect(socket_, resolver.resolve(host, port), 
-            [this, host](auto ec, auto end_point) {
-                if (!ec) {
-                    socket_.async_send(net::buffer(request_), 
-                        [this](auto ec, auto bytes_sent) {
-                            if (!ec) {
-                                read_header();
-                            } else {
-                                promise_.set_exception(std::make_exception_ptr(ec));
-                            }
-                        });
-                } else {
-                    promise_.set_exception(std::make_exception_ptr(ec));
-                }
-            });
-    }
-
-    void read_header()
-    {
-        net::async_read_until(socket_, net::dynamic_buffer(header_), HEADER_END,
-            [this](auto ec, std::size_t bytes_in_header) {
-                if (!ec) 
-                {
-                    assert(header_.find(HEADER_END) + HEADER_END.length() == bytes_in_header && bytes_in_header <= header_.length());
-                    // Extract the HTTP response code from the 1st line
-                    if (std::smatch m; std::regex_search(header_, m, std::regex(R"=(^HTTP\/\d\.\d\s(\d+).*)=")) && m.size() == 2) {
-                        response_code_ = std::stoi(m[1].str());
-                    }
-
-                    read_body(bytes_in_header);
-                } else {
-                    promise_.set_exception(std::make_exception_ptr(ec));
-                }
-            });
-    }
-
-    void read_body(std::size_t bytes_in_header)
-    {
-        net::async_read(socket_, net::dynamic_buffer(body_),
-            net::transfer_all(),
-            [this, bytes_in_header](auto ec, auto bytes_trans) {
-                if (!ec || ec == net::stream_errc::eof) // "end of file" error is expected
-                {
-                    // Insert the end of header_ at the beginning of body_ 
-                    // (slightly inefficient but shouldn't be too bad).
-                    if (bytes_in_header < header_.length()) {
-                        body_.insert(0, header_.substr(bytes_in_header));
-                    }
-
-                    promise_.set_value( response_data{ response_code_,
-                                                       std::move(header_.substr(0, bytes_in_header - HEADER_END.length())), 
-                                                       std::move(body_)} );
-                } else {
-                    promise_.set_exception(std::make_exception_ptr(ec));
-                }
-                std::error_code close_ec;
-                socket_.close(close_ec);
-            });
-    }
-
-//data:
-    static const std::string HEADER_END;// = "\r\n\r\n"s;
-    net::io_context&     io_context_;
-    net::ip::tcp::socket socket_;
-    std::string          request_;
-    int                  response_code_ = 0;
-    std::string          header_;
-    std::string          body_;
-    std::promise<response_data> promise_;
-};
-const std::string web_page_getter::HEADER_END = "\r\n\r\n"s;
-#endif
-
 //==============================================================================
 int main(int, char*[])
 {
-    static const auto domain = "www.boost.org"s;
+    static const auto domain = "localhost"s;//"www.boost.org"s;
+    static const uint16_t port = 5984;
 
     //--------------------------------------------------------------------------
     if constexpr (EXAMPLE_TO_BUILD == Example::SimpleStream)
@@ -157,11 +59,12 @@ int main(int, char*[])
         // Synchronous HTTP operation with socket
         net::io_context io_context;
         net::ip::tcp::socket   socket(io_context);
-        net::ip::tcp::resolver resolver(io_context);
-        net::connect(socket, resolver.resolve(domain, "http"));
 
-        for (auto v : { "GET / HTTP/1.0\r\n"s
-                      , "Host: "s + domain + "\r\n"s
+        net::ip::tcp::resolver resolver(io_context);
+        net::connect(socket, resolver.resolve(domain, std::to_string(port)));
+
+        for (auto v : { "GET /_all_dbs HTTP/1.0\r\n"s
+                      , "Host: "s + domain + ":"+ std::to_string(port) +"\r\n"s
                       , "Accept: */*\r\n"s
                       , "Connection: close\r\n\r\n"s })
         {
@@ -180,7 +83,7 @@ int main(int, char*[])
             std::cerr << "Error: cannot find response delimiter in \""<< header_buf <<"\""<< std::endl;
             return 1;
         }
-        assert(header_end_pos + HEADER_END.length() < header_buf.length());
+        assert(header_end_pos + HEADER_END.length() <= header_buf.length());
 
         // string_view "header" contains only the response header
         std::string_view header(&header_buf[0], header_end_pos);
@@ -283,24 +186,116 @@ int main(int, char*[])
     //--------------------------------------------------------------------------
     if constexpr (EXAMPLE_TO_BUILD == Example::Callbacks)
     {
+        static const std::string HEADER_END = "\r\n\r\n"s;
+        class http_getter
+        {
+        public:
+            explicit http_getter(net::io_context& io_context)
+                : m_io_context(io_context)
+                , m_socket    (io_context)
+            {}
+
+            struct response_data {
+                int         code = 0;
+                std::string header;
+                std::string body;
+            };
+            std::future<response_data> get_page(const std::string& host, const std::string& resource = "/", uint16_t port = 80)
+            {
+                m_promise = std::promise<response_data>{};
+                m_request = "GET "s+ resource +" HTTP/1.0\r\nHost: "s+ host +"\r\nAccept: */*\r\nConnection: close\r\n\r\n"s;
+                connect(host, std::to_string(port));
+                return m_promise.get_future();
+            }
+
+        private:
+            void connect(const std::string& host, const std::string& port)
+            {
+                net::ip::tcp::resolver resolver(m_io_context);
+                net::async_connect(m_socket, resolver.resolve(host, port),
+                    [this, host](auto ec, auto end_point) {
+                    if (!ec) {
+                        m_socket.async_send(net::buffer(m_request),
+                            [this](auto ec, auto bytes_sent) {
+                            if (!ec) {
+                                read_header();
+                            } else {
+                                m_promise.set_exception(std::make_exception_ptr(ec));
+                            }
+                        });
+                    } else {
+                        m_promise.set_exception(std::make_exception_ptr(ec));
+                    }
+                });
+            }
+
+            void read_header()
+            {
+                net::async_read_until(m_socket, net::dynamic_buffer(m_header), HEADER_END,
+                    [this](auto ec, std::size_t bytes_in_header) {
+                    if (!ec) {
+                        assert(m_header.find(HEADER_END) + HEADER_END.length() == bytes_in_header && bytes_in_header <= m_header.length());
+
+                        int response_code = 0;
+                        if (std::smatch m; std::regex_search(m_header, m, std::regex(R"=(^HTTP\/\d\.\d\s(\d+).*)=")) && m.size() == 2) {
+                            response_code = std::stoi(m[1].str());
+                        }
+
+                        read_body(bytes_in_header, response_code);
+                    } else {
+                        m_promise.set_exception(std::make_exception_ptr(ec));
+                    }
+                });
+            }
+
+            void read_body(std::size_t bytes_in_header, int response_code)
+            {
+                net::async_read(m_socket, net::dynamic_buffer(m_body),
+                    net::transfer_all(),
+                    [this, bytes_in_header, response_code](auto ec, auto bytes_trans) {
+                    if (!ec || ec == net::stream_errc::eof) // "end of file" error is expected
+                    {
+                        // Insert the end of header_ at the beginning of body_ 
+                        if (bytes_in_header < m_header.length()) {
+                            m_body.insert(0, m_header.substr(bytes_in_header));
+                        }
+                        m_promise.set_value(response_data{ 
+                            response_code,
+                            std::move(m_header.substr(0, bytes_in_header - HEADER_END.length())),
+                            std::move(m_body) });
+                    } else {
+                        m_promise.set_exception(std::make_exception_ptr(ec));
+                    }
+                    std::error_code close_ec;
+                    m_socket.close(close_ec);
+                });
+            }
+
+        //data:
+            net::io_context&     m_io_context;
+            net::ip::tcp::socket m_socket;
+            std::string          m_request;
+            std::string          m_header;
+            std::string          m_body;
+            std::promise<response_data> m_promise;
+        };
+
+        
         net::io_context io_context;
 
         auto work = net::make_work_guard(io_context);
         std::thread t = std::thread([&io_context]() { io_context.run(); });
 
-        web_page_getter wpg(io_context);
-
-        auto f = wpg.get_page(domain, "http");
+        http_getter hg(io_context);
+        auto future = hg.get_page(domain, "/_all_dbs", port);
         try {
-            auto [code, header, body] = f.get();
-            std::cout 
-                << "HTTP response code: " << code
-                << "\n====================================\n"
-                << "Header:\n" << header
-                << "\n====================================\n"
-                << "Body:\n" << body << std::endl;
-        }
-        catch (const std::error_code& e) {
+            auto [code, header, body] = future.get();
+            std::cout << "HTTP response code: " << code
+                      << "\n====================================\n"
+                      << "Header:\n" << header
+                      << "\n====================================\n"
+                      << "Body:\n" << body << std::endl;
+        } catch (const std::error_code& e) {
             std::cerr << "Error "<< e.value() <<": \""<< e.message() <<"\"" << std::endl;
         }
 
